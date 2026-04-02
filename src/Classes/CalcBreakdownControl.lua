@@ -287,6 +287,25 @@ function CalcBreakdownClass:AddModSection(sectionData, modList)
 			rowList = modStore:Tabulate(sectionData.modType, cfg, sectionData.modName)
 		end
 	end
+	if sectionData.includeBaseSource then
+		local activeSkill = actor.mainSkill
+		local activeEffect = activeSkill and activeSkill.activeEffect
+		local grantedEffect = activeEffect and activeEffect.grantedEffect
+		local baseModName = type(sectionData.modName) == "table" and sectionData.modName[1] or sectionData.modName
+		if grantedEffect and baseModName then
+			t_insert(rowList, {
+				value = sectionData.baseSourceValue or 0,
+				sourceName = grantedEffect.name,
+				mod = {
+					name = baseModName,
+					type = sectionData.modType or "BASE",
+					source = sectionData.baseSource or "Base",
+					flags = 0,
+					keywordFlags = 0,
+				},
+			})
+		end
+	end
 	if #rowList == 0 then
 		return
 	end
@@ -310,6 +329,13 @@ function CalcBreakdownClass:AddModSection(sectionData, modList)
 	if not modList and not sectionData.modType then
 		-- Sort modifiers by type
 		table.sort(rowList, function(a, b)
+			if sectionData.baseSourceFirst then
+				local aIsBase = (a.mod and a.mod.source == "Base")
+				local bIsBase = (b.mod and b.mod.source == "Base")
+				if aIsBase ~= bIsBase then
+					return aIsBase
+				end
+			end
 			if a.mod.type == b.mod.type then
 				return a.mod.name > b.mod.name or (a.mod.name == b.mod.name and type(a.value) == "number" and type(b.value) == "number") and a.value > b.value
 			else
@@ -318,6 +344,13 @@ function CalcBreakdownClass:AddModSection(sectionData, modList)
 		end)
 	else -- Sort modifiers by value
 		table.sort(rowList, function(a, b)
+			if sectionData.baseSourceFirst then
+				local aIsBase = (a.mod and a.mod.source == "Base")
+				local bIsBase = (b.mod and b.mod.source == "Base")
+				if aIsBase ~= bIsBase then
+					return aIsBase
+				end
+			end
 			return a.mod.name > b.mod.name or (a.mod.name == b.mod.name and type(a.value) == "number" and type(b.value) == "number") and a.value > b.value
 		end)
 	end
@@ -374,8 +407,16 @@ function CalcBreakdownClass:AddModSection(sectionData, modList)
 			-- No modifier type specified, so format the value to convey type
 			row.displayValue = self:FormatModValue(row.value, row.mod.type)
 		else
-			section.colList[1].right = true
-			row.displayValue = formatRound(row.value, 2)
+			if sectionData.modValueFormat == "typed" then
+				if sectionData.hideZeroBaseValue and row.mod and row.mod.source == "Base" and row.value == 0 then
+					row.displayValue = ""
+				else
+					row.displayValue = self:FormatModValue(row.value, sectionData.modType)
+				end
+			else
+				section.colList[1].right = true
+				row.displayValue = formatRound(row.value, 2)
+			end
 		end
 		if modList or type(sectionData.modName) == "table" then
 			-- Multiple stat names specified, add this modifier's stat to the table
