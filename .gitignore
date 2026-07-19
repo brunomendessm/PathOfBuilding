@@ -18,6 +18,7 @@ luajit/
 spec/test_results.log
 spec/test_generation.log
 src/luacov.stats.out
+src/sensitivity_report.txt
 
 # Release
 manifest-updated.xml

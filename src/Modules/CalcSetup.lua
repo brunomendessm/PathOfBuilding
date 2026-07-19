@@ -582,6 +582,14 @@ function calcs.initEnv(build, mode, override, specEnv)
 		end
 	end
 
+	-- Arbitrary modifiers injected by the caller, used to measure the effect of a
+	-- hypothetical change without having to express it as an item or tree node.
+	if override.extraMods then
+		for _, mod in ipairs(override.extraMods) do
+			modDB:AddMod(mod)
+		end
+	end
+
 	local allocatedNotableCount = env.spec.allocatedNotableCount
 	local allocatedKeystoneCount = env.spec.allocatedKeystoneCount
 	local allocatedMasteryCount = env.spec.allocatedMasteryCount

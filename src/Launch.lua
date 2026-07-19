@@ -146,6 +146,13 @@ function launch:OnKeyDown(key, doubleClick)
 		local before = collectgarbage("count")
 		collectgarbage("collect")
 		ConPrintf("%dkB => %dkB", before, collectgarbage("count"))
+	elseif key == "F7" and self.devMode then
+		local build = main and main.modes and main.modes["BUILD"]
+		if build and build.calcsTab then
+			build.calcsTab.calcs.runSensitivity(build)
+		else
+			ConPrintf("Sensitivity: no build is currently open.")
+		end
 	elseif key == "PAUSE" and self.devMode and profiler then
 		if profiling then
 			profiler.stop()
