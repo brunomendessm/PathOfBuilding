@@ -18,12 +18,18 @@ local m_abs = math.abs
 local m_floor = math.floor
 local m_min = math.min
 local m_max = math.max
+local m_ceil = math.ceil
 
 -- Sample points, as multiples of the nominal step for each axis. Sweeping instead of
 -- taking a single sample is what exposes non-linearity: a build with compounding
 -- synergies (attribute stackers, conversion chains) returns more per unit as the
 -- investment grows, which a single derivative at the margin would hide.
 local sweepPoints = { 0.25, 0.5, 1, 2, 4 }
+
+-- Sample points used when an axis has a known quantum. Every sample is then a whole
+-- number of thresholds away from the build's current position, so all of them sit in the
+-- same phase and their marginal yields can be compared to each other.
+local alignedPoints = { 1, 2, 4, 8, 16 }
 
 -- Pool axes are stats the build holds a quantity of, so a percentage change is
 -- meaningful and elasticity is comparable across all of them.
@@ -33,9 +39,12 @@ local poolAxes = {
 	{ label = "Strength", stat = "Str", mod = "Str", affixPattern = "^%+%(%d+%-(%d+)%) to Strength$" },
 	{ label = "Dexterity", stat = "Dex", mod = "Dex", affixPattern = "^%+%(%d+%-(%d+)%) to Dexterity$" },
 	{ label = "Intelligence", stat = "Int", mod = "Int", affixPattern = "^%+%(%d+%-(%d+)%) to Intelligence$" },
-	{ label = "Life", stat = "Life", mod = "Life", affixPattern = "^%+%(%d+%-(%d+)%) to maximum Life$" },
+	-- relatedStats names stats that this axis moves indirectly. Adding maximum Life raises
+	-- Life Reserved, which is what The Ivory Tower's energy shield modifier keys off, so
+	-- the axis inherits that modifier's quantisation through the chain.
+	{ label = "Life", stat = "Life", mod = "Life", affixPattern = "^%+%(%d+%-(%d+)%) to maximum Life$", relatedStats = { "LifeReserved", "LifeReservedPercent" } },
 	{ label = "Energy Shield", stat = "EnergyShield", mod = "EnergyShield", affixPattern = "^%+%(%d+%-(%d+)%) to maximum Energy Shield$" },
-	{ label = "Mana", stat = "Mana", mod = "Mana", affixPattern = "^%+%(%d+%-(%d+)%) to maximum Mana$" },
+	{ label = "Mana", stat = "Mana", mod = "Mana", affixPattern = "^%+%(%d+%-(%d+)%) to maximum Mana$", relatedStats = { "ManaUnreserved", "ManaReserved" } },
 	{ label = "Accuracy", stat = "Accuracy", mod = "Accuracy", affixPattern = "^%+%(%d+%-(%d+)%) to Accuracy Rating$" },
 	{ label = "Armour", stat = "Armour", mod = "Armour", affixPattern = "^%+%(%d+%-(%d+)%) to Armour$" },
 	{ label = "Evasion", stat = "Evasion", mod = "Evasion", affixPattern = "^%+%(%d+%-(%d+)%) to Evasion Rating$" },
@@ -94,6 +103,14 @@ end
 ---the division, so the modifier only pays out when the underlying stat crosses a multiple
 ---of the divisor. A marginal sample can land either side of a threshold, which is what
 ---makes a derivative untrustworthy on these axes.
+---
+---This only finds quantisation expressed as a modifier. The calculation engine also floors
+---in places that never appear in the mod database -- Strength's melee bonus is
+---floor(Str/5) in CalcPerform, and Energy Blade floors the weapon damage it derives from
+---energy shield in CalcOffence. Those cannot be listed here, and the second kind cannot be
+---aligned away at all, since the floor lands on a derived value whose relationship to the
+---injected stat is fractional. An axis feeding such a path will stay IRREGULAR no matter
+---how the sampling is chosen, and that is the honest answer rather than a shortcoming.
 ---@param modDB table @Player mod database
 ---@param output table @Player output, used to locate the next threshold
 local function findSteppedMods(modDB, output)
@@ -122,6 +139,71 @@ local function findSteppedMods(modDB, output)
 	end
 	t_sort(found, function(a, b) return a.granted > b.granted end)
 	return found
+end
+
+local function gcd(a, b)
+	while b ~= 0 do
+		a, b = b, a % b
+	end
+	return a
+end
+
+---Computes the sampling quantum for an axis: the smallest increment that advances every
+---stepped modifier feeding that axis by a whole number of thresholds. Sampling at
+---multiples of it keeps every sample in the same phase, which is what turns a bouncing
+---marginal yield into a readable curve.
+---@param axis table
+---@param stepped table @Output of findSteppedMods
+---@param calcFunc function
+---@param baseOutput table
+---@return number|nil, string|nil @Quantum in the axis's own units, and how it was derived
+local function computeQuantum(axis, stepped, calcFunc, baseOutput)
+	local quantum, reason
+
+	-- Direct sources key off the axis stat itself, so their divisor is already expressed
+	-- in the units being injected and several of them combine as a least common multiple.
+	for _, m in ipairs(stepped) do
+		if m.stat == axis.stat and m.div > 1 then
+			quantum = quantum and (quantum * m.div / gcd(quantum, m.div)) or m.div
+			reason = reason and (reason .. "+" .. m.div) or tostring(m.div)
+		end
+	end
+
+	-- Indirect sources key off a stat this axis only moves through a chain. The transfer
+	-- ratio depends on the build (how much life is actually reserved, for instance), so it
+	-- is measured with a probe rather than assumed.
+	local related = { }
+	for _, stat in ipairs(axis.relatedStats or { }) do
+		related[stat] = true
+	end
+	local probed
+	for _, m in ipairs(stepped) do
+		if related[m.stat] and m.div > 1 then
+			if not probed then
+				local probeAmount = 100
+				local output = calcFunc({ extraMods = { modLib.createMod(axis.mod, "BASE", probeAmount, "Sensitivity") } })
+				probed = { output = output, amount = probeAmount }
+			end
+			local moved = (probed.output[m.stat] or 0) - (baseOutput[m.stat] or 0)
+			local ratio = moved / probed.amount
+			if ratio > 0 then
+				local effective = m.div / ratio
+				if not quantum or effective > quantum then
+					quantum = effective
+					reason = s_format("%g %s / %.3f", m.div, m.stat, ratio)
+				end
+			end
+		end
+	end
+
+	if quantum then
+		-- Rounded up rather than incremented: a least common multiple is already exact,
+		-- and adding to it would put every sample a little further out of phase than the
+		-- last, which is the opposite of the point. Only a measured quantum is fractional,
+		-- and there ceiling is enough to clear the threshold.
+		quantum = m_ceil(quantum)
+	end
+	return quantum, reason
 end
 
 ---Classifies how the return on an axis changes as investment grows.
@@ -175,18 +257,16 @@ end
 ---Runs one axis through the full sweep.
 ---@param calcFunc function @Calculator from calcs.getMiscCalculator
 ---@param baseValue number @Target metric before any injection
----@param nominalStep number @Amount injected at sweep point 1.0
+---@param amounts number[] @Exact amounts to inject, one per sample point
 ---@param modFactory function @Given an amount, returns the list of mods to inject
 ---@param statName string @Output field holding the target metric
-local function sweepAxis(calcFunc, baseValue, nominalStep, modFactory, statName)
+local function sweepAxis(calcFunc, baseValue, amounts, modFactory, statName)
 	local samples = { }
-	for _, point in ipairs(sweepPoints) do
-		local amount = nominalStep * point
+	for _, amount in ipairs(amounts) do
 		local output = calcFunc({ extraMods = modFactory(amount) })
 		local newValue = output[statName] or 0
 		local delta = newValue - baseValue
 		t_insert(samples, {
-			point = point,
 			amount = amount,
 			delta = delta,
 			-- Marginal yield per unit injected, which is what makes sample points
@@ -252,17 +332,31 @@ function calcs.runSensitivity(build, statName, showSweep)
 
 	local poolResults, multResults, inertAxes = { }, { }, { }
 
-	-- Pool axes: step is 1% of what the build already has, so the reported
-	-- elasticity reads directly as "% metric gained per 1% more of this stat".
+	-- Resolved before sweeping so each axis can align its sample points to the thresholds
+	-- that actually apply to it.
+	local mainEnv = build.calcsTab and build.calcsTab.mainEnv
+	local modDB = mainEnv and mainEnv.player and mainEnv.player.modDB
+	local stepped = modDB and findSteppedMods(modDB, baseOutput) or { }
+
 	for _, axis in ipairs(poolAxes) do
 		local current = baseOutput[axis.stat] or 0
 		if current > 0 then
-			local step = current * 0.01
-			local samples = sweepAxis(calcFunc, baseValue, step, function(amount)
+			-- Where an axis is quantised, sample at multiples of its quantum so every
+			-- point sits the same distance past a threshold. Where it is not, any step
+			-- size is as arbitrary as another, so fall back to a share of the pool.
+			local quantum, quantumWhy = computeQuantum(axis, stepped, calcFunc, baseOutput)
+			local amounts = { }
+			for _, point in ipairs(quantum and alignedPoints or sweepPoints) do
+				t_insert(amounts, quantum and (quantum * point) or (current * 0.01 * point))
+			end
+
+			local samples = sweepAxis(calcFunc, baseValue, amounts, function(amount)
 				return { modLib.createMod(axis.mod, "BASE", amount, "Sensitivity") }
 			end, statName)
 			local nominal = samples[3]
-			local elasticity = (nominal.delta / baseValue) / 0.01
+			-- Expressed per proportional change in the stat, so it stays comparable
+			-- across axes whose sample sizes now differ.
+			local elasticity = (nominal.delta / baseValue) / (nominal.amount / current)
 
 			-- Measured rather than extrapolated from the sweep: on a stepped axis a
 			-- linear extrapolation from a different step size can be badly off.
@@ -277,7 +371,7 @@ function calcs.runSensitivity(build, statName, showSweep)
 			local entry = {
 				label = axis.label,
 				current = current,
-				step = step,
+				step = nominal.amount,
 				delta = nominal.delta,
 				elasticity = elasticity,
 				curve = classifyCurve(samples),
@@ -286,6 +380,8 @@ function calcs.runSensitivity(build, statName, showSweep)
 				affixName = affixName,
 				affixGain = affixGain,
 				affixPct = affixPct,
+				quantum = quantum,
+				quantumWhy = quantumWhy,
 			}
 			if m_abs(elasticity) < 0.0001 then
 				t_insert(inertAxes, axis.label)
@@ -298,7 +394,11 @@ function calcs.runSensitivity(build, statName, showSweep)
 	-- Multiplier axes: no pool to normalise against, so these are reported as the
 	-- absolute gain from one affix-sized chunk of investment.
 	for _, axis in ipairs(multiplierAxes) do
-		local samples = sweepAxis(calcFunc, baseValue, axis.step, function(amount)
+		local amounts = { }
+		for _, point in ipairs(sweepPoints) do
+			t_insert(amounts, axis.step * point)
+		end
+		local samples = sweepAxis(calcFunc, baseValue, amounts, function(amount)
 			return { modLib.createMod(axis.mod, axis.modType, amount, "Sensitivity", axis.flags) }
 		end, statName)
 		local nominal = samples[3]
@@ -343,6 +443,24 @@ function calcs.runSensitivity(build, statName, showSweep)
 		end
 	end
 
+	-- Stated openly because it changes what the sweep measured: an aligned axis was
+	-- sampled at its own thresholds, not at a share of the pool like the others.
+	local anyAligned = false
+	for _, r in ipairs(poolResults) do
+		if r.quantum then
+			anyAligned = true
+		end
+	end
+	if anyAligned then
+		out("")
+		out("Eixos amostrados alinhados aos degraus (quantum, origem):")
+		for _, r in ipairs(poolResults) do
+			if r.quantum then
+				out("  %-16s a cada %-7g (%s)", r.label, r.quantum, r.quantumWhy or "?")
+			end
+		end
+	end
+
 	out("")
 	out("--- EIXOS MULTIPLICADORES (ganho por afixo tipico) ---")
 	out("%-28s %8s %14s %8s  %s", "Eixo", "Passo", "Ganho", "%", "Curva")
@@ -353,10 +471,7 @@ function calcs.runSensitivity(build, statName, showSweep)
 	-- Stepped scaling sources present in this build. Printed unconditionally because they
 	-- are what makes the curve column unreliable, and because the distance to the next
 	-- threshold is directly actionable.
-	local mainEnv = build.calcsTab and build.calcsTab.mainEnv
-	local modDB = mainEnv and mainEnv.player and mainEnv.player.modDB
 	if modDB then
-		local stepped = findSteppedMods(modDB, baseOutput)
 		out("")
 		out("--- FONTES DE ESCALONAMENTO EM DEGRAU (PerStat com divisao inteira) ---")
 		if #stepped == 0 then
@@ -368,6 +483,9 @@ function calcs.runSensitivity(build, statName, showSweep)
 			end
 			out("")
 			out("'Falta' = quanto do stat falta para o proximo degrau.")
+			out("Cobre apenas degraus vindos de modificadores. O motor tambem trunca em")
+			out("pontos fixos (bonus de Str = floor(Str/5); dano da Energy Blade truncado a")
+			out("partir do ES), que nao aparecem aqui e podem manter um eixo IRREGULAR.")
 		end
 	else
 		out("")
@@ -381,13 +499,16 @@ function calcs.runSensitivity(build, statName, showSweep)
 	-- when a classification looks suspect.
 	if showSweep then
 		out("")
-		out("--- DETALHE DO SWEEP (ganho absoluto em cada ponto de amostragem) ---")
-		out("%-28s %12s %12s %12s %12s %12s", "Eixo", "x0.25", "x0.5", "x1", "x2", "x4")
+		out("--- DETALHE DO SWEEP (ganho por unidade injetada em cada ponto) ---")
+		out("Eixos alinhados amostram em 1/2/4/8/16 x quantum; os demais em")
+		out("0.25/0.5/1/2/4 x 1%% do pool. Por isso a comparacao aqui e por unidade,")
+		out("nao por ganho absoluto: so assim pontos de tamanhos diferentes se comparam.")
+		out("%-28s %11s %11s %11s %11s %11s", "Eixo", "ponto 1", "ponto 2", "ponto 3", "ponto 4", "ponto 5")
 		local function dumpSamples(results)
 			for _, r in ipairs(results) do
 				local cells = { }
 				for _, s in ipairs(r.samples) do
-					t_insert(cells, s_format("%12.0f", s.delta))
+					t_insert(cells, s_format("%11.1f", s.perUnit))
 				end
 				out("%-28s %s", r.label, table.concat(cells, " "))
 			end
