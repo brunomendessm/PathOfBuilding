@@ -1,6 +1,10 @@
 # Stat Sensitivity Analysis
 
-Status: prototype, dev mode only (`F7`, `Shift+F7` for detail). No UI yet.
+Status: prototype. Runs from the Analytics tab, and from `F7` / `Shift+F7` in dev mode,
+which writes the same report to console and to a text file.
+
+The measurement engine returns data (`calcs.buildSensitivityReport`) and both surfaces are
+consumers of it, so the tab and the text report cannot drift apart.
 
 ## The question it answers
 
@@ -202,8 +206,11 @@ of step sources does not read as exhaustive.
 so it weighs more on smaller injections. On the reference build strength's smallest
 sample yields 16,070 per point against about 19–20k for the rest, and that one point
 accounts for nearly all its reported spread. Down-weighting small samples would clean
-up the trends but would also blind the threshold detection that surfaced dexterity,
-so the trade-off is unresolved rather than silently taken.
+up the trends but would also blind the threshold detection that surfaced dexterity.
+
+The tab sidesteps having to choose: the table shows the conservative classification, and
+the tooltip shows every raw sample behind it, so a reader who disagrees can see why. The
+underlying question of which sample to trust is still open.
 
 **Unexplained threshold on dexterity.** +20 and +40 produce exactly zero, +60 produces
 179,683, +80 produces the same. Neither listed step source accounts for a jump of
@@ -213,21 +220,31 @@ that size, particularly with the build dealing no physical damage. Not diagnosed
 `Increased Life` still classifies as irregular — it feeds the same reserved-life
 thresholds through a percentage rather than a flat amount.
 
-**Metric is fixed** to `TotalDPS`, so defensive axes cannot be compared.
+**Report strings are in Portuguese** in the dev-mode text output, from prototyping. The
+tab is in English. The text output needs translating before any upstream submission.
 
-**The run is synchronous** and blocks the UI for a few seconds. A shippable version
-needs a coroutine, as the tree power report does.
+**Section heights in the tab are fixed**, so a build with many stepped sources will
+scroll inside its section rather than the section growing to fit.
 
-**Report strings are in Portuguese**, from prototyping. These need translating before
-any upstream submission.
-
-## Cost
+## Cost and staleness
 
 Roughly 200 full calculation passes: about 23 axes at five sample points, plus one
-affix measurement per pool axis, one probe per indirect quantum, and one control
-pass. The tree power report performs comparable work across thousands of nodes, so
-the order of magnitude is established; the difference is only that this has no
-coroutine yet.
+affix measurement per pool axis, one probe per indirect quantum, and one control pass.
+The tree power report performs comparable work across thousands of nodes, so the order
+of magnitude is established.
+
+That cost is why the analysis runs on demand rather than live, and running on demand is
+why staleness has to be tracked. Results are positional: they describe the build at the
+moment it was measured, and on a build that scales in steps a small edit moves every
+number. On the reference build, an equipment change between two runs moved life's
+elasticity from 0.023 to 0.806.
+
+Staleness is therefore tracked against `build.outputRevision`, the counter incremented
+whenever the calculations are rebuilt, rather than a flag that each mutating path has to
+remember to set. No edit can leave stale numbers looking current.
+
+Changing the metric clears the results outright instead of marking them stale, because
+they answer a different question rather than an outdated version of the same one.
 
 ## Validation
 

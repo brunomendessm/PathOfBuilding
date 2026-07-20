@@ -469,6 +469,10 @@ function buildMode:Init(dbFileName, buildName, buildXML, convertBuild, importLin
 		self.viewMode = "COMPARE"
 	end)
 	self.controls.modeCompare.locked = function() return self.viewMode == "COMPARE" end
+	self.controls.modeAnalytics = new("ButtonControl", {"LEFT",self.controls.modeCompare,"RIGHT"}, {4, 0, 72, 20}, "Analytics", function()
+		self.viewMode = "ANALYTICS"
+	end)
+	self.controls.modeAnalytics.locked = function() return self.viewMode == "ANALYTICS" end
 	-- Skills
 	self.controls.mainSkillLabel = new("LabelControl", {"TOPLEFT",self.anchorSideBar,"TOPLEFT"}, {0, 80, 300, 16}, "^7Main Skill:")
 	self.controls.mainSocketGroup = new("DropDownControl", {"TOPLEFT",self.controls.mainSkillLabel,"BOTTOMLEFT"}, {0, 2, 300, 18}, nil, function(index, value)
@@ -606,6 +610,7 @@ function buildMode:Init(dbFileName, buildName, buildXML, convertBuild, importLin
 	self.compareTab = new("CompareTab", self)
 	-- Used for pined calcs panes
 	self.overlayPanes = { }
+	self.analyticsTab = new("AnalyticsTab", self)
 
 	-- Load sections from the build file
 	self.savers = {
@@ -1287,6 +1292,8 @@ function buildMode:OnFrame(inputEvents)
 		self.calcsTab:Draw(tabViewPort, inputEvents)
 	elseif self.viewMode == "COMPARE" then
 		self.compareTab:Draw(tabViewPort, inputEvents)
+	elseif self.viewMode == "ANALYTICS" then
+		self.analyticsTab:Draw(tabViewPort, inputEvents)
 	end
 
 	-- Draw overlay panes on top of all tab content (last = topmost)

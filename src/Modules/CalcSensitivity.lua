@@ -277,63 +277,57 @@ local function sweepAxis(calcFunc, baseValue, amounts, modFactory, statName)
 	return samples
 end
 
----Measures every axis against a target metric and reports a ranked breakdown.
----Output goes to both the console and a text file, since the console toggle is
----unreliable on non-US keyboard layouts.
+
+---Builds the full sensitivity report as data.
+---Yields periodically when run inside a coroutine, so a caller driving this from a UI
+---can keep drawing; the work is a few hundred full calculation passes and would
+---otherwise freeze the interface for seconds.
 ---@param build table
 ---@param statName string|nil @Output field to optimise for; defaults to Hit DPS
----@param showSweep boolean|nil @Also dump every sample point behind each classification
-function calcs.runSensitivity(build, statName, showSweep)
+---@param progressCallback function|nil @Called with a percentage as the sweep advances
+---@return table @Report data, or a table carrying only an error field
+function calcs.buildSensitivityReport(build, statName, progressCallback)
 	statName = statName or "TotalDPS"
-
-	local lines = { }
-	local function out(fmt, ...)
-		local line = select("#", ...) > 0 and s_format(fmt, ...) or fmt
-		t_insert(lines, line)
-		ConPrintf("%s", line)
-	end
-
-	local function writeReport()
-		local path = (main and main.userPath or "") .. "sensitivity_report.txt"
-		local file = io.open(path, "w")
-		if not file then
-			ConPrintf("Sensitivity: could not write report to %s", path)
-			return
-		end
-		file:write(table.concat(lines, "\n"), "\n")
-		file:close()
-		ConPrintf("Sensitivity: report written to %s", path)
-	end
 
 	local calcFunc, baseOutput = calcs.getMiscCalculator(build)
 	local baseValue = baseOutput[statName] or 0
-
-	out("=== ANALISE DE SENSIBILIDADE =============================")
-	out("Metrica alvo : %s", statName)
-	out("Valor base   : %.1f", baseValue)
-
 	if baseValue == 0 then
-		out("ERRO: metrica base vale zero, nada a comparar.")
-		writeReport()
-		return
+		return { error = "Base value for " .. statName .. " is zero; nothing to compare against." }
 	end
 
-	-- Control pass: injecting nothing must reproduce the base value. If it does not,
-	-- the calculator is not rebuilding the character faithfully (some setup that only
-	-- happens on the initial pass has been lost), and every number below would be
-	-- measuring that discrepancy rather than the axis under test.
+	local report = {
+		statName = statName,
+		baseValue = baseValue,
+		pool = { },
+		mult = { },
+		stepped = { },
+		inert = { },
+	}
+
+	-- Progress is counted in calculation passes rather than axes, since an aligned pool
+	-- axis costs more than a multiplier one and a flat count would stall visibly.
+	local totalPasses = 1 + (#poolAxes * (#sweepPoints + 2)) + (#multiplierAxes * #sweepPoints)
+	local donePasses = 0
+	local lastYield = GetTime()
+	local function progressed(n)
+		donePasses = donePasses + (n or 1)
+		if coroutine.running() and GetTime() - lastYield > 100 then
+			if progressCallback then
+				progressCallback(m_floor(donePasses / totalPasses * 100))
+			end
+			coroutine.yield()
+			lastYield = GetTime()
+		end
+	end
+
+	-- Control pass: injecting nothing must reproduce the base value. If it does not, the
+	-- calculator is not rebuilding the character faithfully and every number below would
+	-- be measuring that discrepancy rather than the axis under test.
 	local controlValue = calcFunc({ extraMods = { } })[statName] or 0
-	local drift = m_abs(controlValue - baseValue) / baseValue
-	if drift > 0.001 then
-		out("")
-		out("AVISO: passe de controle divergiu da base em %.2f%% (%.1f vs %.1f).", drift * 100, controlValue, baseValue)
-		out("Os numeros abaixo NAO sao confiaveis - o calculador nao esta reproduzindo a build.")
-	end
+	progressed()
+	report.controlValue = controlValue
+	report.controlDrift = m_abs(controlValue - baseValue) / baseValue
 
-	local poolResults, multResults, inertAxes = { }, { }, { }
-
-	-- Resolved before sweeping so each axis can align its sample points to the thresholds
-	-- that actually apply to it.
 	local mainEnv = build.calcsTab and build.calcsTab.mainEnv
 	local modDB = mainEnv and mainEnv.player and mainEnv.player.modDB
 	local stepped = modDB and findSteppedMods(modDB, baseOutput) or { }
@@ -341,10 +335,8 @@ function calcs.runSensitivity(build, statName, showSweep)
 	for _, axis in ipairs(poolAxes) do
 		local current = baseOutput[axis.stat] or 0
 		if current > 0 then
-			-- Where an axis is quantised, sample at multiples of its quantum so every
-			-- point sits the same distance past a threshold. Where it is not, any step
-			-- size is as arbitrary as another, so fall back to a share of the pool.
 			local quantum, quantumWhy = computeQuantum(axis, stepped, calcFunc, baseOutput)
+			progressed()
 			local amounts = { }
 			for _, point in ipairs(quantum and alignedPoints or sweepPoints) do
 				t_insert(amounts, quantum and (quantum * point) or (current * 0.01 * point))
@@ -353,26 +345,26 @@ function calcs.runSensitivity(build, statName, showSweep)
 			local samples = sweepAxis(calcFunc, baseValue, amounts, function(amount)
 				return { modLib.createMod(axis.mod, "BASE", amount, "Sensitivity") }
 			end, statName)
+			progressed(#amounts)
+
 			local nominal = samples[3]
-			-- Expressed per proportional change in the stat, so it stays comparable
-			-- across axes whose sample sizes now differ.
 			local elasticity = (nominal.delta / baseValue) / (nominal.amount / current)
 
-			-- Measured rather than extrapolated from the sweep: on a stepped axis a
-			-- linear extrapolation from a different step size can be badly off.
 			local affixSize, affixName = findTopAffix(axis.affixPattern)
 			local affixGain, affixPct
 			if affixSize then
 				local output = calcFunc({ extraMods = { modLib.createMod(axis.mod, "BASE", affixSize, "Sensitivity") } })
 				affixGain = (output[statName] or 0) - baseValue
 				affixPct = affixGain / baseValue * 100
+				progressed()
 			end
 
 			local entry = {
 				label = axis.label,
+				stat = axis.stat,
 				current = current,
-				step = nominal.amount,
 				delta = nominal.delta,
+				perUnit = nominal.perUnit,
 				elasticity = elasticity,
 				curve = classifyCurve(samples),
 				samples = samples,
@@ -384,15 +376,13 @@ function calcs.runSensitivity(build, statName, showSweep)
 				quantumWhy = quantumWhy,
 			}
 			if m_abs(elasticity) < 0.0001 then
-				t_insert(inertAxes, axis.label)
+				t_insert(report.inert, axis.label)
 			else
-				t_insert(poolResults, entry)
+				t_insert(report.pool, entry)
 			end
 		end
 	end
 
-	-- Multiplier axes: no pool to normalise against, so these are reported as the
-	-- absolute gain from one affix-sized chunk of investment.
 	for _, axis in ipairs(multiplierAxes) do
 		local amounts = { }
 		for _, point in ipairs(sweepPoints) do
@@ -401,6 +391,8 @@ function calcs.runSensitivity(build, statName, showSweep)
 		local samples = sweepAxis(calcFunc, baseValue, amounts, function(amount)
 			return { modLib.createMod(axis.mod, axis.modType, amount, "Sensitivity", axis.flags) }
 		end, statName)
+		progressed(#amounts)
+
 		local nominal = samples[3]
 		local entry = {
 			label = axis.label,
@@ -412,126 +404,161 @@ function calcs.runSensitivity(build, statName, showSweep)
 			samples = samples,
 		}
 		if m_abs(entry.pct) < 0.0001 then
-			t_insert(inertAxes, axis.label)
+			t_insert(report.inert, axis.label)
 		else
-			t_insert(multResults, entry)
+			t_insert(report.mult, entry)
 		end
 	end
 
-	-- Ordered by per-affix gain, which is the actionable question ("what should I put in
-	-- the next slot"). Elasticity is kept as a column because it answers the structural
-	-- question instead, and the two orderings genuinely disagree: a stat with a small
-	-- pool is cheap to move by 1% but still capped by what one affix can grant.
-	t_sort(poolResults, function(a, b) return (a.affixGain or -1) > (b.affixGain or -1) end)
-	t_sort(multResults, function(a, b) return a.pct > b.pct end)
+	t_sort(report.pool, function(a, b) return (a.affixGain or -1) > (b.affixGain or -1) end)
+	t_sort(report.mult, function(a, b) return a.pct > b.pct end)
 
-	out("")
-	out("--- EIXOS DE POOL (ordenado por ganho de um afixo real) ---")
-	out("%-16s %9s %8s %13s %7s %8s  %s", "Eixo", "Atual", "Afixo", "Ganho/afixo", "%", "Elast.", "Curva")
-	for _, r in ipairs(poolResults) do
-		if r.affixSize then
-			out("%-16s %9.0f %8d %13.1f %6.2f%% %8.3f  %s", r.label, r.current, r.affixSize, r.affixGain, r.affixPct, r.elasticity, r.curve)
-		else
-			out("%-16s %9.0f %8s %13s %7s %8.3f  %s", r.label, r.current, "n/d", "n/d", "n/d", r.elasticity, r.curve)
-		end
+	-- Each threshold is priced using the measured yield of the stat it grants, which turns
+	-- "35 more reserved life" into a number comparable with everything else on screen.
+	-- Left nil where that stat had no measurable effect, rather than guessed at.
+	local yieldByStat = { }
+	for _, entry in ipairs(report.pool) do
+		yieldByStat[entry.stat] = entry.perUnit
 	end
-	out("")
-	out("Afixo = maior roll plano do pool explicito do jogo. Fontes:")
-	for _, r in ipairs(poolResults) do
-		if r.affixName then
-			out("  %-16s +%d (%s)", r.label, r.affixSize, r.affixName)
-		end
+	for _, m in ipairs(stepped) do
+		m.worth = yieldByStat[m.name] and (m.value * yieldByStat[m.name]) or nil
+	end
+	t_sort(stepped, function(a, b) return (a.worth or -1) > (b.worth or -1) end)
+	report.stepped = stepped
+
+	if progressCallback then
+		progressCallback(100)
+	end
+	return report
+end
+
+---Writes the report to the console and to a text file.
+---Kept as a thin consumer of the report data so the dev-mode path stays available
+---independently of the tab, and so the two cannot drift apart.
+---@param build table
+---@param statName string|nil
+---@param showSweep boolean|nil @Also dump every sample point behind each classification
+function calcs.runSensitivity(build, statName, showSweep)
+	local lines = { }
+	local function out(fmt, ...)
+		local line = select("#", ...) > 0 and s_format(fmt, ...) or fmt
+		t_insert(lines, line)
+		ConPrintf("%s", line)
 	end
 
-	-- Stated openly because it changes what the sweep measured: an aligned axis was
-	-- sampled at its own thresholds, not at a share of the pool like the others.
-	local anyAligned = false
-	for _, r in ipairs(poolResults) do
-		if r.quantum then
-			anyAligned = true
+	local report = calcs.buildSensitivityReport(build, statName)
+
+	out("=== ANALISE DE SENSIBILIDADE =============================")
+	if report.error then
+		out("ERRO: %s", report.error)
+	else
+		out("Metrica alvo : %s", report.statName)
+		out("Valor base   : %.1f", report.baseValue)
+
+		if report.controlDrift > 0.001 then
+			out("")
+			out("AVISO: passe de controle divergiu da base em %.2f%% (%.1f vs %.1f).", report.controlDrift * 100, report.controlValue, report.baseValue)
+			out("Os numeros abaixo NAO sao confiaveis - o calculador nao esta reproduzindo a build.")
 		end
-	end
-	if anyAligned then
+
 		out("")
-		out("Eixos amostrados alinhados aos degraus (quantum, origem):")
-		for _, r in ipairs(poolResults) do
-			if r.quantum then
-				out("  %-16s a cada %-7g (%s)", r.label, r.quantum, r.quantumWhy or "?")
+		out("--- EIXOS DE POOL (ordenado por ganho de um afixo real) ---")
+		out("%-16s %9s %8s %13s %7s %8s  %s", "Eixo", "Atual", "Afixo", "Ganho/afixo", "%", "Elast.", "Curva")
+		for _, r in ipairs(report.pool) do
+			if r.affixSize then
+				out("%-16s %9.0f %8d %13.1f %6.2f%% %8.3f  %s", r.label, r.current, r.affixSize, r.affixGain, r.affixPct, r.elasticity, r.curve)
+			else
+				out("%-16s %9.0f %8s %13s %7s %8.3f  %s", r.label, r.current, "n/d", "n/d", "n/d", r.elasticity, r.curve)
 			end
 		end
-	end
 
-	out("")
-	out("--- EIXOS MULTIPLICADORES (ganho por afixo tipico) ---")
-	out("%-28s %8s %14s %8s  %s", "Eixo", "Passo", "Ganho", "%", "Curva")
-	for _, r in ipairs(multResults) do
-		out("%-28s %7d%s %14.1f %7.2f%%  %s", r.label, r.step, r.unit, r.delta, r.pct, r.curve)
-	end
+		out("")
+		out("Afixo = maior roll plano do pool explicito do jogo. Fontes:")
+		for _, r in ipairs(report.pool) do
+			if r.affixName then
+				out("  %-16s +%d (%s)", r.label, r.affixSize, r.affixName)
+			end
+		end
 
-	-- Stepped scaling sources present in this build. Printed unconditionally because they
-	-- are what makes the curve column unreliable, and because the distance to the next
-	-- threshold is directly actionable.
-	if modDB then
+		local anyAligned = false
+		for _, r in ipairs(report.pool) do
+			if r.quantum then
+				anyAligned = true
+			end
+		end
+		if anyAligned then
+			out("")
+			out("Eixos amostrados alinhados aos degraus (quantum, origem):")
+			for _, r in ipairs(report.pool) do
+				if r.quantum then
+					out("  %-16s a cada %-7g (%s)", r.label, r.quantum, r.quantumWhy or "?")
+				end
+			end
+		end
+
+		out("")
+		out("--- EIXOS MULTIPLICADORES (ganho por afixo tipico) ---")
+		out("%-28s %8s %14s %8s  %s", "Eixo", "Passo", "Ganho", "%", "Curva")
+		for _, r in ipairs(report.mult) do
+			out("%-28s %7d%s %14.1f %7.2f%%  %s", r.label, r.step, r.unit, r.delta, r.pct, r.curve)
+		end
+
 		out("")
 		out("--- FONTES DE ESCALONAMENTO EM DEGRAU (PerStat com divisao inteira) ---")
-		if #stepped == 0 then
+		if #report.stepped == 0 then
 			out("Nenhuma encontrada.")
 		else
-			out("%-18s %7s %-18s %9s %7s %9s %9s", "Concede", "Por", "A cada N de", "Atual", "Degraus", "Total", "Falta")
-			for _, m in ipairs(stepped) do
-				out("%-18s %7.1f %-18s %9.0f %7d %9.1f %9.1f", m.name, m.value, m.div .. " " .. m.stat, m.current, m.steps, m.granted, m.toNext)
+			out("%-18s %7s %-18s %9s %7s %9s %9s %12s", "Concede", "Por", "A cada N de", "Atual", "Degraus", "Total", "Falta", "Vale")
+			for _, m in ipairs(report.stepped) do
+				out("%-18s %7.1f %-18s %9.0f %7d %9.1f %9.1f %12s", m.name, m.value, m.div .. " " .. m.stat, m.current, m.steps, m.granted, m.toNext,
+					m.worth and s_format("%.0f", m.worth) or "-")
 			end
 			out("")
-			out("'Falta' = quanto do stat falta para o proximo degrau.")
+			out("Falta = quanto do stat falta para o proximo degrau.")
+			out("Vale = ganho na metrica ao cruzar esse degrau.")
 			out("Cobre apenas degraus vindos de modificadores. O motor tambem trunca em")
 			out("pontos fixos (bonus de Str = floor(Str/5); dano da Energy Blade truncado a")
 			out("partir do ES), que nao aparecem aqui e podem manter um eixo IRREGULAR.")
 		end
-	else
-		out("")
-		out("(nao foi possivel inspecionar o modDB para fontes em degrau)")
-	end
 
-	-- Raw sample points behind every classification. The summary tables report a single
-	-- derivative, which is only trustworthy when the axis pays out continuously; this
-	-- section is what lets a stepped or non-linear axis be recognised as such instead of
-	-- being read as a smooth number. Off by default because it is only worth reading
-	-- when a classification looks suspect.
-	if showSweep then
-		out("")
-		out("--- DETALHE DO SWEEP (ganho por unidade injetada em cada ponto) ---")
-		out("Eixos alinhados amostram em 1/2/4/8/16 x quantum; os demais em")
-		out("0.25/0.5/1/2/4 x 1%% do pool. Por isso a comparacao aqui e por unidade,")
-		out("nao por ganho absoluto: so assim pontos de tamanhos diferentes se comparam.")
-		out("%-28s %11s %11s %11s %11s %11s", "Eixo", "ponto 1", "ponto 2", "ponto 3", "ponto 4", "ponto 5")
-		local function dumpSamples(results)
-			for _, r in ipairs(results) do
-				local cells = { }
-				for _, s in ipairs(r.samples) do
-					t_insert(cells, s_format("%11.1f", s.perUnit))
+		if showSweep then
+			out("")
+			out("--- DETALHE DO SWEEP (ganho por unidade injetada em cada ponto) ---")
+			out("%-28s %11s %11s %11s %11s %11s", "Eixo", "ponto 1", "ponto 2", "ponto 3", "ponto 4", "ponto 5")
+			local function dumpSamples(results)
+				for _, r in ipairs(results) do
+					local cells = { }
+					for _, s in ipairs(r.samples) do
+						t_insert(cells, s_format("%11.1f", s.perUnit))
+					end
+					out("%-28s %s", r.label, table.concat(cells, " "))
 				end
-				out("%-28s %s", r.label, table.concat(cells, " "))
+			end
+			dumpSamples(report.pool)
+			dumpSamples(report.mult)
+		else
+			out("")
+			out("(Shift+F7 para o detalhe do sweep de cada eixo)")
+		end
+
+		if #report.inert > 0 then
+			out("")
+			out("--- SEM EFEITO MENSURAVEL (verificar se se aplica a esta build) ---")
+			for _, label in ipairs(report.inert) do
+				out("  %s", label)
 			end
 		end
-		dumpSamples(poolResults)
-		dumpSamples(multResults)
-	else
-		out("")
-		out("(Shift+F7 para o detalhe do sweep de cada eixo)")
 	end
-
-	-- Surfaced explicitly rather than dropped: an axis reading zero may genuinely not
-	-- apply to this build, but it can equally mean the injection never landed. Silently
-	-- omitting them would make a broken axis look like an irrelevant one.
-	if #inertAxes > 0 then
-		out("")
-		out("--- SEM EFEITO MENSURAVEL (verificar se se aplica a esta build) ---")
-		for _, label in ipairs(inertAxes) do
-			out("  %s", label)
-		end
-	end
-
 	out("")
 	out("=== FIM ==================================================")
-	writeReport()
+
+	local path = (main and main.userPath or "") .. "sensitivity_report.txt"
+	local file = io.open(path, "w")
+	if file then
+		file:write(table.concat(lines, "\n"), "\n")
+		file:close()
+		ConPrintf("Sensitivity: report written to %s", path)
+	else
+		ConPrintf("Sensitivity: could not write report to %s", path)
+	end
 end
