@@ -9,10 +9,15 @@
 
 local calcs = ...
 local ipairs = ipairs
+local pairs = pairs
+local type = type
 local t_insert = table.insert
 local t_sort = table.sort
 local s_format = string.format
 local m_abs = math.abs
+local m_floor = math.floor
+local m_min = math.min
+local m_max = math.max
 
 -- Sample points, as multiples of the nominal step for each axis. Sweeping instead of
 -- taking a single sample is what exposes non-linearity: a build with compounding
@@ -22,16 +27,18 @@ local sweepPoints = { 0.25, 0.5, 1, 2, 4 }
 
 -- Pool axes are stats the build holds a quantity of, so a percentage change is
 -- meaningful and elasticity is comparable across all of them.
+-- affixPattern matches the flat affix that grants the stat, with a single capture for
+-- the top of the roll, so the per-affix column can be sourced from the real mod pool.
 local poolAxes = {
-	{ label = "Strength", stat = "Str", mod = "Str" },
-	{ label = "Dexterity", stat = "Dex", mod = "Dex" },
-	{ label = "Intelligence", stat = "Int", mod = "Int" },
-	{ label = "Life", stat = "Life", mod = "Life" },
-	{ label = "Energy Shield", stat = "EnergyShield", mod = "EnergyShield" },
-	{ label = "Mana", stat = "Mana", mod = "Mana" },
-	{ label = "Accuracy", stat = "Accuracy", mod = "Accuracy" },
-	{ label = "Armour", stat = "Armour", mod = "Armour" },
-	{ label = "Evasion", stat = "Evasion", mod = "Evasion" },
+	{ label = "Strength", stat = "Str", mod = "Str", affixPattern = "^%+%(%d+%-(%d+)%) to Strength$" },
+	{ label = "Dexterity", stat = "Dex", mod = "Dex", affixPattern = "^%+%(%d+%-(%d+)%) to Dexterity$" },
+	{ label = "Intelligence", stat = "Int", mod = "Int", affixPattern = "^%+%(%d+%-(%d+)%) to Intelligence$" },
+	{ label = "Life", stat = "Life", mod = "Life", affixPattern = "^%+%(%d+%-(%d+)%) to maximum Life$" },
+	{ label = "Energy Shield", stat = "EnergyShield", mod = "EnergyShield", affixPattern = "^%+%(%d+%-(%d+)%) to maximum Energy Shield$" },
+	{ label = "Mana", stat = "Mana", mod = "Mana", affixPattern = "^%+%(%d+%-(%d+)%) to maximum Mana$" },
+	{ label = "Accuracy", stat = "Accuracy", mod = "Accuracy", affixPattern = "^%+%(%d+%-(%d+)%) to Accuracy Rating$" },
+	{ label = "Armour", stat = "Armour", mod = "Armour", affixPattern = "^%+%(%d+%-(%d+)%) to Armour$" },
+	{ label = "Evasion", stat = "Evasion", mod = "Evasion", affixPattern = "^%+%(%d+%-(%d+)%) to Evasion Rating$" },
 }
 
 -- Multiplier axes have no pool to normalise against, so they are reported as the
@@ -53,6 +60,70 @@ local multiplierAxes = {
 	{ label = "Increased Energy Shield", mod = "EnergyShield", modType = "INC", step = 10, unit = "%" },
 }
 
+---Finds the largest roll of a flat affix matching the given pattern in the explicit mod
+---pool. This keeps the per-affix column tied to what the game can actually roll, rather
+---than to an assumed affix size that would quietly decide the ranking.
+---Only mods with a non-zero spawn weight somewhere are considered, to skip mods that
+---exist in the data but cannot appear on an item.
+---@param pattern string @Lua pattern with one capture for the top of the roll
+---@return number|nil, string|nil @Highest roll found, and the affix name it came from
+local function findTopAffix(pattern)
+	local best, bestAffix
+	for _, modEntry in pairs(data.itemMods.Explicit) do
+		local rollable = false
+		for _, weight in ipairs(modEntry.weightVal or { }) do
+			if weight > 0 then
+				rollable = true
+				break
+			end
+		end
+		if rollable then
+			for _, line in ipairs(modEntry) do
+				local roll = tonumber(line:match(pattern) or "")
+				if roll and (not best or roll > best) then
+					best, bestAffix = roll, modEntry.affix
+				end
+			end
+		end
+	end
+	return best, bestAffix
+end
+
+---Lists modifiers whose value is quantised by integer division (a PerStat tag with a
+---divisor above 1). These are the mechanical source of stepped scaling: ModStore floors
+---the division, so the modifier only pays out when the underlying stat crosses a multiple
+---of the divisor. A marginal sample can land either side of a threshold, which is what
+---makes a derivative untrustworthy on these axes.
+---@param modDB table @Player mod database
+---@param output table @Player output, used to locate the next threshold
+local function findSteppedMods(modDB, output)
+	local found = { }
+	for name, modList in pairs(modDB.mods) do
+		for _, mod in ipairs(modList) do
+			for _, tag in ipairs(mod) do
+				if tag.type == "PerStat" and (tag.div or 1) > 1 and type(mod.value) == "number" then
+					local stat = tag.stat or (tag.statList and table.concat(tag.statList, "+")) or "?"
+					local current = output[stat] or 0
+					local steps = m_floor(current / tag.div)
+					t_insert(found, {
+						name = name,
+						value = mod.value,
+						div = tag.div,
+						stat = stat,
+						current = current,
+						steps = steps,
+						granted = mod.value * steps,
+						toNext = (steps + 1) * tag.div - current,
+						source = mod.source or "?",
+					})
+				end
+			end
+		end
+	end
+	t_sort(found, function(a, b) return a.granted > b.granted end)
+	return found
+end
+
 ---Classifies how the return on an axis changes as investment grows.
 ---Compares the marginal yield of the smallest sample against the largest.
 local function classifyCurve(samples)
@@ -68,6 +139,30 @@ local function classifyCurve(samples)
 		-- relative to the next threshold.
 		return last.perUnit ~= 0 and "ESCADA (ver sweep)" or "sem efeito"
 	end
+
+	-- A trend is only meaningful when the marginal yield moves consistently in one
+	-- direction. Quantised scaling ("+1 Energy Shield per 10 Strength") makes it bounce
+	-- instead, and comparing only the endpoints would render that bouncing as a
+	-- confident-looking trend. Direction changes alone are not enough to reject a trend,
+	-- since the smallest samples carry rounding noise; the spread between the best and
+	-- worst yield has to be wide enough to matter as well.
+	local rising, falling = false, false
+	local lo, hi = first.perUnit, first.perUnit
+	for i = 2, #samples do
+		local prev, cur = samples[i - 1].perUnit, samples[i].perUnit
+		if prev > 0 then
+			if cur / prev > 1.02 then
+				rising = true
+			elseif cur / prev < 0.98 then
+				falling = true
+			end
+		end
+		lo, hi = m_min(lo, cur), m_max(hi, cur)
+	end
+	if rising and falling and lo > 0 and hi / lo > 1.25 then
+		return s_format("IRREGULAR (%.2fx)", hi / lo)
+	end
+
 	local ratio = last.perUnit / first.perUnit
 	if ratio > 1.05 then
 		return s_format("acelera (x%.2f)", ratio)
@@ -107,7 +202,8 @@ end
 ---unreliable on non-US keyboard layouts.
 ---@param build table
 ---@param statName string|nil @Output field to optimise for; defaults to Hit DPS
-function calcs.runSensitivity(build, statName)
+---@param showSweep boolean|nil @Also dump every sample point behind each classification
+function calcs.runSensitivity(build, statName, showSweep)
 	statName = statName or "TotalDPS"
 
 	local lines = { }
@@ -167,6 +263,17 @@ function calcs.runSensitivity(build, statName)
 			end, statName)
 			local nominal = samples[3]
 			local elasticity = (nominal.delta / baseValue) / 0.01
+
+			-- Measured rather than extrapolated from the sweep: on a stepped axis a
+			-- linear extrapolation from a different step size can be badly off.
+			local affixSize, affixName = findTopAffix(axis.affixPattern)
+			local affixGain, affixPct
+			if affixSize then
+				local output = calcFunc({ extraMods = { modLib.createMod(axis.mod, "BASE", affixSize, "Sensitivity") } })
+				affixGain = (output[statName] or 0) - baseValue
+				affixPct = affixGain / baseValue * 100
+			end
+
 			local entry = {
 				label = axis.label,
 				current = current,
@@ -175,6 +282,10 @@ function calcs.runSensitivity(build, statName)
 				elasticity = elasticity,
 				curve = classifyCurve(samples),
 				samples = samples,
+				affixSize = affixSize,
+				affixName = affixName,
+				affixGain = affixGain,
+				affixPct = affixPct,
 			}
 			if m_abs(elasticity) < 0.0001 then
 				t_insert(inertAxes, axis.label)
@@ -207,14 +318,29 @@ function calcs.runSensitivity(build, statName)
 		end
 	end
 
-	t_sort(poolResults, function(a, b) return a.elasticity > b.elasticity end)
+	-- Ordered by per-affix gain, which is the actionable question ("what should I put in
+	-- the next slot"). Elasticity is kept as a column because it answers the structural
+	-- question instead, and the two orderings genuinely disagree: a stat with a small
+	-- pool is cheap to move by 1% but still capped by what one affix can grant.
+	t_sort(poolResults, function(a, b) return (a.affixGain or -1) > (b.affixGain or -1) end)
 	t_sort(multResults, function(a, b) return a.pct > b.pct end)
 
 	out("")
-	out("--- EIXOS DE POOL (elasticidade: %% metrica por +1%% do stat) ---")
-	out("%-16s %10s %9s %14s %8s  %s", "Eixo", "Atual", "+1%", "Ganho", "Elast.", "Curva")
+	out("--- EIXOS DE POOL (ordenado por ganho de um afixo real) ---")
+	out("%-16s %9s %8s %13s %7s %8s  %s", "Eixo", "Atual", "Afixo", "Ganho/afixo", "%", "Elast.", "Curva")
 	for _, r in ipairs(poolResults) do
-		out("%-16s %10.0f %9.1f %14.1f %8.3f  %s", r.label, r.current, r.step, r.delta, r.elasticity, r.curve)
+		if r.affixSize then
+			out("%-16s %9.0f %8d %13.1f %6.2f%% %8.3f  %s", r.label, r.current, r.affixSize, r.affixGain, r.affixPct, r.elasticity, r.curve)
+		else
+			out("%-16s %9.0f %8s %13s %7s %8.3f  %s", r.label, r.current, "n/d", "n/d", "n/d", r.elasticity, r.curve)
+		end
+	end
+	out("")
+	out("Afixo = maior roll plano do pool explicito do jogo. Fontes:")
+	for _, r in ipairs(poolResults) do
+		if r.affixName then
+			out("  %-16s +%d (%s)", r.label, r.affixSize, r.affixName)
+		end
 	end
 
 	out("")
@@ -224,24 +350,54 @@ function calcs.runSensitivity(build, statName)
 		out("%-28s %7d%s %14.1f %7.2f%%  %s", r.label, r.step, r.unit, r.delta, r.pct, r.curve)
 	end
 
+	-- Stepped scaling sources present in this build. Printed unconditionally because they
+	-- are what makes the curve column unreliable, and because the distance to the next
+	-- threshold is directly actionable.
+	local mainEnv = build.calcsTab and build.calcsTab.mainEnv
+	local modDB = mainEnv and mainEnv.player and mainEnv.player.modDB
+	if modDB then
+		local stepped = findSteppedMods(modDB, baseOutput)
+		out("")
+		out("--- FONTES DE ESCALONAMENTO EM DEGRAU (PerStat com divisao inteira) ---")
+		if #stepped == 0 then
+			out("Nenhuma encontrada.")
+		else
+			out("%-18s %7s %-18s %9s %7s %9s %9s", "Concede", "Por", "A cada N de", "Atual", "Degraus", "Total", "Falta")
+			for _, m in ipairs(stepped) do
+				out("%-18s %7.1f %-18s %9.0f %7d %9.1f %9.1f", m.name, m.value, m.div .. " " .. m.stat, m.current, m.steps, m.granted, m.toNext)
+			end
+			out("")
+			out("'Falta' = quanto do stat falta para o proximo degrau.")
+		end
+	else
+		out("")
+		out("(nao foi possivel inspecionar o modDB para fontes em degrau)")
+	end
+
 	-- Raw sample points behind every classification. The summary tables report a single
 	-- derivative, which is only trustworthy when the axis pays out continuously; this
 	-- section is what lets a stepped or non-linear axis be recognised as such instead of
-	-- being read as a smooth number.
-	out("")
-	out("--- DETALHE DO SWEEP (ganho absoluto em cada ponto de amostragem) ---")
-	out("%-28s %12s %12s %12s %12s %12s", "Eixo", "x0.25", "x0.5", "x1", "x2", "x4")
-	local function dumpSamples(results)
-		for _, r in ipairs(results) do
-			local cells = { }
-			for _, s in ipairs(r.samples) do
-				t_insert(cells, s_format("%12.0f", s.delta))
+	-- being read as a smooth number. Off by default because it is only worth reading
+	-- when a classification looks suspect.
+	if showSweep then
+		out("")
+		out("--- DETALHE DO SWEEP (ganho absoluto em cada ponto de amostragem) ---")
+		out("%-28s %12s %12s %12s %12s %12s", "Eixo", "x0.25", "x0.5", "x1", "x2", "x4")
+		local function dumpSamples(results)
+			for _, r in ipairs(results) do
+				local cells = { }
+				for _, s in ipairs(r.samples) do
+					t_insert(cells, s_format("%12.0f", s.delta))
+				end
+				out("%-28s %s", r.label, table.concat(cells, " "))
 			end
-			out("%-28s %s", r.label, table.concat(cells, " "))
 		end
+		dumpSamples(poolResults)
+		dumpSamples(multResults)
+	else
+		out("")
+		out("(Shift+F7 para o detalhe do sweep de cada eixo)")
 	end
-	dumpSamples(poolResults)
-	dumpSamples(multResults)
 
 	-- Surfaced explicitly rather than dropped: an axis reading zero may genuinely not
 	-- apply to this build, but it can equally mean the injection never landed. Silently

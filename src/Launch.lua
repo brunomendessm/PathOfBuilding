@@ -149,7 +149,7 @@ function launch:OnKeyDown(key, doubleClick)
 	elseif key == "F7" and self.devMode then
 		local build = main and main.modes and main.modes["BUILD"]
 		if build and build.calcsTab then
-			build.calcsTab.calcs.runSensitivity(build)
+			build.calcsTab.calcs.runSensitivity(build, nil, IsKeyDown("SHIFT"))
 		else
 			ConPrintf("Sensitivity: no build is currently open.")
 		end
